@@ -244,9 +244,9 @@
     <input type="text" id="channel-name" placeholder="My TV Channel" maxlength="60" />
   </div>
   <div class="field">
-    <label>Real-Debrid API key <span style="color:var(--muted);font-weight:400">(optional — for fast direct streams)</span></label>
-    <input type="text" id="torrentio-url" placeholder="Paste your RD API key…" autocomplete="off" />
-    <span style="font-size:0.78rem;color:var(--muted)">Get it from <a href="https://real-debrid.com/apitoken" target="_blank" style="color:var(--accent2)">real-debrid.com/apitoken</a></span>
+    <label>Torrentio manifest URL <span style="color:var(--muted);font-weight:400">(optional — paste yours for Real-Debrid streams)</span></label>
+    <input type="text" id="torrentio-url" placeholder="https://torrentio.strem.fun/realdebrid=…/manifest.json" autocomplete="off" />
+    <span style="font-size:0.78rem;color:var(--muted)">In Stremio → Add-ons → find Torrentio → click the ⚙️ icon → copy the URL shown in your browser's address bar.</span>
   </div>
 </div>
 
@@ -456,12 +456,12 @@
 
   // ── Install ────────────────────────────────────────────────────────────────
   function buildConfig() {
-    const rdKey = document.getElementById('torrentio-url').value.trim();
+    const rdKey = document.getElementById('torrentio-url').value.trim().replace(/\/manifest\.json$/, '');
     const cfg = {
       name:  document.getElementById('channel-name').value.trim() || 'Random TV Channel',
       shows: shows.map(s => ({ id: s.id, name: s.name, poster: s.poster })),
     };
-    if (rdKey) cfg.rdKey = rdKey;
+    if (rdKey) cfg.torrentioUrl = rdKey;
     return cfg;
   }
 

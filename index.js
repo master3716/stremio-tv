@@ -349,10 +349,13 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
 
   console.log(`[stream] Resolving: ${fullTitle} → ${torrentId}`);
 
-  // Build Torrentio base URL — use RD key if provided
-  const torrentioBase = config.rdKey
-    ? `${TORRENTIO}/realdebrid=${config.rdKey}`
-    : TORRENTIO;
+  // Build Torrentio base URL from manifest URL (strip /manifest.json if present)
+  // Supports both torrentioUrl (full manifest URL) and legacy rdKey field
+  const torrentioBase = config.torrentioUrl
+    ? config.torrentioUrl.replace(/\/manifest\.json$/, '')
+    : config.rdKey
+      ? `${TORRENTIO}/realdebrid=${config.rdKey}`
+      : TORRENTIO;
 
   // Fetch streams — try with RD, fall back to base Torrentio if RD returns nothing
   let torrentStreams = [];
@@ -380,13 +383,8 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
   console.log(`[stream] Got ${torrentStreams.length} streams for ${torrentId}`);
 
   if (torrentStreams.length === 0) {
-    return res.json({
-      streams: [{
-        name:        `📺 ${ep.showName}`,
-        title:       `${episodeLabel} · ${ep.title}\n⚠️ No streams found for this episode`,
-        externalUrl: `https://www.imdb.com/title/${ep.showId}/episodes/?season=${ep.season}`,
-      }],
-    });
+    console.error(`[stream] No streams found for ${torrentId} using base: ${torrentioBase.replace(/realdebrid=[^/]+/, 'realdebrid=***')}`);
+    return res.json({ streams: [] });
   }
 
   const bingeGroup = `tvchannel-${req.params.config.substring(0, 8)}`;
