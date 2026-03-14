@@ -11,7 +11,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const PORT = process.env.PORT || 7000;
 const ADDON_URL = (process.env.ADDON_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 
-const CINEMETA = 'https://v3-cinemeta.strem.io';
+const CINEMETA  = 'https://v3-cinemeta.strem.io';
 const TORRENTIO = 'https://torrentio.strem.fun';
 
 // ─── Seeded PRNG (Mulberry32) ────────────────────────────────────────────────
@@ -29,89 +29,138 @@ function seededRandom(seed) {
 function decodeConfig(str) {
   try {
     return JSON.parse(Buffer.from(str, 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-function encodeConfig(config) {
-  return Buffer.from(JSON.stringify(config)).toString('base64url');
+// ─── CINEMETA helpers ─────────────────────────────────────────────────────────
+const metaCache = new Map();
+
+async function fetchShowMeta(showId) {
+  if (metaCache.has(showId)) return metaCache.get(showId);
+  const res = await axios.get(`${CINEMETA}/meta/series/${showId}.json`, { timeout: 10000 });
+  const meta = res.data.meta;
+  metaCache.set(showId, meta);
+  setTimeout(() => metaCache.delete(showId), 7200000); // 2hr TTL
+  return meta;
 }
 
-// ─── CINEMETA episode cache ──────────────────────────────────────────────────
-const episodeCache = new Map();
-
-async function getEpisodes(showId) {
-  if (episodeCache.has(showId)) return episodeCache.get(showId);
-  const res = await axios.get(`${CINEMETA}/meta/series/${showId}.json`, {
-    timeout: 8000,
-  });
-  const episodes = (res.data.meta.videos || []).filter(
-    (v) => v.season > 0 && (v.episode || v.number)
-  );
-  episodeCache.set(showId, episodes);
-  // Expire after 2 hours
-  setTimeout(() => episodeCache.delete(showId), 7200000);
-  return episodes;
+function parseRuntime(runtimeStr) {
+  if (!runtimeStr) return null;
+  const m = String(runtimeStr).match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
 }
 
-// ─── Channel logic ───────────────────────────────────────────────────────────
-function getCurrentSlot(intervalMinutes) {
-  return Math.floor(Date.now() / (intervalMinutes * 60 * 1000));
-}
+// ─── Schedule logic ───────────────────────────────────────────────────────────
+//
+// Episodes play back-to-back in a deterministic shuffled order.
+// Each episode's slot duration = the show's typical runtime (from CINEMETA).
+// After all episodes have played, the list cycles again with a new shuffle.
+// The current episode is determined by where the current wall-clock time falls
+// in the cumulative runtime timeline.
+//
+// This means the channel naturally advances to the next episode when the
+// current one ends, just like a real TV channel.
 
-async function getEpisodeForSlot(shows, slotIndex) {
-  if (!shows || shows.length === 0) return null;
-  const rand = seededRandom(slotIndex);
+async function buildSchedule(shows) {
+  const allEps = [];
+  for (const show of shows) {
+    let meta;
+    try { meta = await fetchShowMeta(show.id); } catch { continue; }
 
-  // Shuffle shows array for this slot so every show gets fair rotation
-  const shuffled = [...shows];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
+    const runtime = parseRuntime(meta?.runtime) || 22; // minutes, fallback 22
+    const episodes = (meta?.videos || []).filter(v => v.season > 0 && (v.episode || v.number));
 
-  // Try each show until we find one with episodes
-  for (const show of shuffled) {
-    try {
-      const episodes = await getEpisodes(show.id);
-      if (episodes.length === 0) continue;
-      const epIndex = Math.floor(rand() * episodes.length);
-      const ep = episodes[epIndex];
-      return {
-        showId: show.id,
-        showName: show.name,
+    for (const ep of episodes) {
+      allEps.push({
+        showId:    show.id,
+        showName:  show.name,
         showPoster: show.poster || null,
-        season: ep.season,
-        episode: ep.episode || ep.number,
-        title: ep.name || ep.title || `Episode ${ep.episode || ep.number}`,
+        season:    ep.season,
+        episode:   ep.episode || ep.number,
+        title:     ep.name || ep.title || `Episode ${ep.episode || ep.number}`,
         thumbnail: ep.thumbnail || null,
-      };
-    } catch {
-      // skip unavailable show
+        runtime,   // minutes
+      });
     }
   }
-  return null;
+  return allEps;
 }
 
-function pad(n) {
-  return String(n).padStart(2, '0');
-}
-
-// ─── API proxy (used by configure page) ─────────────────────────────────────
-app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').trim();
-  if (!q) return res.json({ metas: [] });
-  try {
-    const r = await axios.get(
-      `${CINEMETA}/catalog/series/top/search=${encodeURIComponent(q)}.json`,
-      { timeout: 6000 }
-    );
-    res.json(r.data);
-  } catch {
-    res.json({ metas: [] });
+// Deterministically shuffle an array using a seeded PRNG
+function seededShuffle(arr, seed) {
+  const a = [...arr];
+  const rand = seededRandom(seed);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
   }
-});
+  return a;
+}
+
+// Given the full episode list, return which episode is playing at `nowMs`
+// and all upcoming episodes (for the schedule view).
+// The list cycles: after the last episode, it reshuffles with a new seed.
+function resolveSchedule(episodes, nowMs, upcomingCount = 20) {
+  if (episodes.length === 0) return [];
+
+  const nowMinutes = nowMs / 60000;
+  const result = [];
+
+  // We walk forward in time from the beginning of the first cycle
+  // Cycle 0 uses seed 0, cycle 1 uses seed 1, etc.
+  // Each cycle is a fresh shuffle of the full episode list.
+
+  let timeAccum = 0;
+  let cycle = 0;
+
+  // Find where we are right now first (fast-forward to current position)
+  // Total runtime per cycle
+  const totalRuntimePerCycle = episodes.reduce((s, e) => s + e.runtime, 0);
+  if (totalRuntimePerCycle === 0) return [];
+
+  // Which cycle are we in?
+  cycle = Math.floor(nowMinutes / totalRuntimePerCycle);
+  const posInCycle = nowMinutes % totalRuntimePerCycle;
+
+  // Walk the current cycle to find the current episode
+  let shuffled = seededShuffle(episodes, cycle);
+  let cumul = 0;
+  let startIdx = 0;
+  for (let i = 0; i < shuffled.length; i++) {
+    if (posInCycle < cumul + shuffled[i].runtime) {
+      startIdx = i;
+      timeAccum = cycle * totalRuntimePerCycle + cumul;
+      break;
+    }
+    cumul += shuffled[i].runtime;
+  }
+
+  // Now collect `upcomingCount` episodes starting from current
+  let c = cycle;
+  let sh = shuffled;
+  let idx = startIdx;
+
+  while (result.length < upcomingCount) {
+    const ep = sh[idx];
+    result.push({
+      ...ep,
+      startsAtMs: timeAccum * 60000,
+      endsAtMs:   (timeAccum + ep.runtime) * 60000,
+      episodeIndex: c * episodes.length + idx,
+    });
+    timeAccum += ep.runtime;
+    idx++;
+    if (idx >= sh.length) {
+      c++;
+      sh = seededShuffle(episodes, c);
+      idx = 0;
+    }
+  }
+
+  return result;
+}
+
+function pad(n) { return String(n).padStart(2, '0'); }
 
 // ─── Static assets ───────────────────────────────────────────────────────────
 app.get('/channel-poster.png', (_req, res) => {
@@ -144,177 +193,175 @@ app.get('/logo.png', (_req, res) => {
 app.get('/configure', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'configure.html'));
 });
+app.get('/', (_req, res) => res.redirect('/configure'));
 
-app.get('/', (_req, res) => {
-  res.redirect('/configure');
+// ─── API proxy ───────────────────────────────────────────────────────────────
+app.get('/api/search', async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ metas: [] });
+  try {
+    const r = await axios.get(
+      `${CINEMETA}/catalog/series/top/search=${encodeURIComponent(q)}.json`,
+      { timeout: 6000 }
+    );
+    res.json(r.data);
+  } catch { res.json({ metas: [] }); }
 });
 
-// ─── Stremio addon endpoints ──────────────────────────────────────────────────
-
-// Manifest
+// ─── Manifest ─────────────────────────────────────────────────────────────────
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
 
-  const showNames = (config.shows || []).map((s) => s.name).join(', ');
+  const showNames   = (config.shows || []).map(s => s.name).join(', ');
   const channelName = config.name || 'Random TV Channel';
 
   res.json({
-    id: `tv.randomchannel.${req.params.config.substring(0, 16)}`,
-    version: '1.0.0',
-    name: channelName,
-    description: `Your personal TV channel playing: ${showNames}`,
-    logo: `${ADDON_URL}/logo.png`,
-    resources: ['catalog', 'meta', 'stream'],
-    types: ['series'],
-    catalogs: [
-      {
-        type: 'series',
-        id: 'tv-channel',
-        name: channelName,
-        extra: [{ name: 'skip', isRequired: false }],
-      },
-    ],
+    id:          `tv.randomchannel.${req.params.config.substring(0, 16)}`,
+    version:     '1.0.0',
+    name:        channelName,
+    description: `Your personal TV channel — playing: ${showNames}`,
+    logo:        `${ADDON_URL}/logo.png`,
+    resources:   ['catalog', 'meta', 'stream'],
+    types:       ['series'],
+    catalogs: [{
+      type:  'series',
+      id:    'tv-channel',
+      name:  channelName,
+      extra: [{ name: 'skip', isRequired: false }],
+    }],
     behaviorHints: { adult: false, p2p: false },
   });
 });
 
-// Catalog – returns the single virtual channel item
+// ─── Catalog ──────────────────────────────────────────────────────────────────
 app.get('/:config/catalog/series/tv-channel.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
 
-  const interval = config.interval || 30;
-  const slot = getCurrentSlot(interval);
-
-  let nowEp = null;
+  let desc = `Your random channel with ${(config.shows || []).map(s => s.name).join(', ')}`;
   try {
-    nowEp = await getEpisodeForSlot(config.shows, slot);
+    const eps = await buildSchedule(config.shows || []);
+    const schedule = resolveSchedule(eps, Date.now(), 1);
+    if (schedule.length > 0) {
+      const now = schedule[0];
+      desc = `Now: ${now.showName} · S${pad(now.season)}E${pad(now.episode)} – ${now.title}`;
+    }
   } catch {}
 
-  const desc = nowEp
-    ? `Now Playing: ${nowEp.showName} · S${pad(nowEp.season)}E${pad(nowEp.episode)} – ${nowEp.title}`
-    : `Your random channel with ${(config.shows || []).map((s) => s.name).join(', ')}`;
-
   res.json({
-    metas: [
-      {
-        id: `tvchannel:${req.params.config}`,
-        type: 'series',
-        name: config.name || 'Random TV Channel',
-        poster: `${ADDON_URL}/channel-poster.png`,
-        background: nowEp && nowEp.thumbnail ? nowEp.thumbnail : undefined,
-        description: desc,
-        genres: ['Random TV', 'Channel'],
-        imdbRating: undefined,
-      },
-    ],
+    metas: [{
+      id:          `tvchannel:${req.params.config}`,
+      type:        'series',
+      name:        config.name || 'Random TV Channel',
+      poster:      `${ADDON_URL}/channel-poster.png`,
+      description: desc,
+      genres:      ['Random TV', 'Channel'],
+    }],
   });
 });
 
-// Meta – full series object with upcoming episode schedule as "videos"
+// ─── Meta ─────────────────────────────────────────────────────────────────────
 app.get('/:config/meta/series/:id.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
 
-  const interval = config.interval || 30;
-  const slot = getCurrentSlot(interval);
-  const showNames = (config.shows || []).map((s) => s.name).join(', ');
+  const showNames = (config.shows || []).map(s => s.name).join(', ');
+  const now       = Date.now();
 
-  const videos = [];
-  const SLOTS = 20; // show next 20 slots
-  for (let i = 0; i < SLOTS; i++) {
-    try {
-      const ep = await getEpisodeForSlot(config.shows, slot + i);
-      if (!ep) continue;
+  let videos = [];
+  try {
+    const eps      = await buildSchedule(config.shows || []);
+    const schedule = resolveSchedule(eps, now, 20);
 
+    videos = schedule.map((slot, i) => {
+      const minsLeft = Math.round((slot.endsAtMs - now) / 60000);
       let label;
-      if (i === 0) label = '🔴 NOW';
-      else if (i === 1) label = '⏭ NEXT';
+      if (i === 0)       label = `🔴 NOW  (${minsLeft}m left)`;
+      else if (i === 1)  label = '⏭ NEXT';
       else {
-        const mins = i * interval;
-        label = mins < 60 ? `+${mins}m` : `+${Math.round(mins / 60)}h`;
+        const startsIn = Math.round((slot.startsAtMs - now) / 60000);
+        label = startsIn < 60 ? `+${startsIn}m` : `+${Math.round(startsIn / 60)}h`;
       }
 
-      videos.push({
-        // Encode slot index inside the video id so stream handler can resolve it
-        id: `tvchannel:${req.params.config}:${slot + i}`,
-        title: `${label}  ${ep.showName} · S${pad(ep.season)}E${pad(ep.episode)} – ${ep.title}`,
-        season: 1,
-        number: i + 1,
-        released: new Date(Date.now() + i * interval * 60 * 1000).toISOString(),
-        thumbnail: ep.thumbnail || undefined,
-        overview: `${ep.showName} · Season ${ep.season}, Episode ${ep.episode}`,
-      });
-    } catch {}
-  }
+      return {
+        id:       `tvchannel:${req.params.config}:${slot.episodeIndex}`,
+        title:    `${label}  ${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} – ${slot.title}`,
+        season:   1,
+        number:   i + 1,
+        released: new Date(slot.startsAtMs).toISOString(),
+        thumbnail: slot.thumbnail || undefined,
+        overview: `${slot.showName} · Season ${slot.season}, Episode ${slot.episode} · ${slot.runtime} min`,
+      };
+    });
+  } catch {}
 
   res.json({
     meta: {
-      id: req.params.id,
-      type: 'series',
-      name: config.name || 'Random TV Channel',
-      poster: `${ADDON_URL}/channel-poster.png`,
-      description: `Your personal random TV channel.\nShowing: ${showNames}\nEpisodes rotate every ${interval} minute${interval !== 1 ? 's' : ''}.`,
-      genres: ['Random TV', 'Channel'],
+      id:          req.params.id,
+      type:        'series',
+      name:        config.name || 'Random TV Channel',
+      poster:      `${ADDON_URL}/channel-poster.png`,
+      description: `Your personal random TV channel.\nShowing: ${showNames}\nEpisodes advance automatically when each one ends.`,
+      genres:      ['Random TV', 'Channel'],
       videos,
     },
   });
 });
 
-// Stream – resolve the slot to a real episode and fetch streams from Torrentio
+// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/:config/stream/series/:id.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.json({ streams: [] });
 
-  // ID format: tvchannel:{configHash}:{slotIndex}
-  const parts = req.params.id.split(':');
-  const slotIndex = parseInt(parts[parts.length - 1], 10);
-  if (isNaN(slotIndex)) return res.json({ streams: [] });
+  // ID format: tvchannel:{configHash}:{episodeIndex}
+  const parts        = req.params.id.split(':');
+  const episodeIndex = parseInt(parts[parts.length - 1], 10);
+  if (isNaN(episodeIndex)) return res.json({ streams: [] });
 
   let ep;
   try {
-    ep = await getEpisodeForSlot(config.shows, slotIndex);
-  } catch {
-    return res.json({ streams: [] });
-  }
+    const eps     = await buildSchedule(config.shows || []);
+    if (eps.length === 0) return res.json({ streams: [] });
+    const shuffled = seededShuffle(eps, Math.floor(episodeIndex / eps.length));
+    ep = shuffled[episodeIndex % eps.length];
+  } catch { return res.json({ streams: [] }); }
+
   if (!ep) return res.json({ streams: [] });
 
   const episodeLabel = `S${pad(ep.season)}E${pad(ep.episode)}`;
-  const fullTitle = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
+  const fullTitle    = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
 
-  // Fetch streams from Torrentio for the real episode
+  // Fetch streams from Torrentio
   let torrentStreams = [];
   try {
-    const torRes = await axios.get(
+    const r = await axios.get(
       `${TORRENTIO}/stream/series/${ep.showId}:${ep.season}:${ep.episode}.json`,
       { timeout: 12000 }
     );
-    torrentStreams = (torRes.data.streams || []).slice(0, 6);
+    torrentStreams = (r.data.streams || []).slice(0, 6);
   } catch {}
 
   if (torrentStreams.length === 0) {
     return res.json({
-      streams: [
-        {
-          name: `📺 ${ep.showName}`,
-          title: `${episodeLabel} · ${ep.title}\n⚠️ No streams found – install Torrentio`,
-          externalUrl: `https://www.imdb.com/title/${ep.showId}/`,
-        },
-      ],
+      streams: [{
+        name:        `📺 ${ep.showName}`,
+        title:       `${episodeLabel} · ${ep.title}\n⚠️ No streams found – install Torrentio`,
+        externalUrl: `https://www.imdb.com/title/${ep.showId}/`,
+      }],
     });
   }
 
-  const streams = torrentStreams.map((s) => ({
-    ...s,
-    name: `📺 ${ep.showName}\n${s.name || ''}`.trim(),
-    title: `${fullTitle}\n${s.title || ''}`.trim(),
-  }));
-
-  res.json({ streams });
+  res.json({
+    streams: torrentStreams.map(s => ({
+      ...s,
+      name:  `📺 ${ep.showName}\n${s.name || ''}`.trim(),
+      title: `${fullTitle}\n${s.title || ''}`.trim(),
+    })),
+  });
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🎬  Random TV Channel addon`);
   console.log(`    Configure → ${ADDON_URL}/configure`);
