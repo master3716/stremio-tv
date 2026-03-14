@@ -340,9 +340,9 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
   const episodeLabel = `S${pad(ep.season)}E${pad(ep.episode)}`;
   const fullTitle    = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
 
-  // Use user's Torrentio URL (e.g. TorrentioRD) if configured, else fallback
-  const torrentioBase = config.torrentioUrl
-    ? config.torrentioUrl.replace(/\/manifest\.json$/, '')
+  // Build Torrentio base URL — use RD key if provided
+  const torrentioBase = config.rdKey
+    ? `${TORRENTIO}/realdebrid=${encodeURIComponent(config.rdKey)}`
     : TORRENTIO;
 
   // Fetch streams
