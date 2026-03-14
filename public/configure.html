@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Random TV Channel – Setup</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0e0e0e;
+      --surface:  #1a1a1a;
+      --surface2: #242424;
+      --border:   #333;
+      --accent:   #7b5ea7;
+      --accent2:  #a47fd4;
+      --red:      #e05260;
+      --green:    #4caf82;
+      --text:     #e8e8e8;
+      --muted:    #888;
+      --radius:   10px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 16px 80px;
+    }
+
+    /* ── Header ── */
+    header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+    header .logo { font-size: 3rem; line-height: 1; margin-bottom: 12px; }
+    header h1 { font-size: 1.9rem; font-weight: 700; }
+    header p  { color: var(--muted); margin-top: 6px; font-size: 0.95rem; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      width: 100%;
+      max-width: 680px;
+      margin-bottom: 20px;
+    }
+    .card h2 {
+      font-size: 1rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--accent2);
+      margin-bottom: 16px;
+    }
+
+    /* ── Inputs ── */
+    .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+    label { font-size: 0.85rem; color: var(--muted); }
+
+    input[type="text"], select {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.95rem;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color .2s;
+      width: 100%;
+    }
+    input[type="text"]:focus, select:focus { border-color: var(--accent); }
+
+    /* ── Search row ── */
+    .search-row { display: flex; gap: 10px; }
+    .search-row input { flex: 1; }
+    button {
+      background: var(--accent);
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 10px 20px;
+      transition: background .2s, transform .1s;
+      white-space: nowrap;
+    }
+    button:hover  { background: var(--accent2); }
+    button:active { transform: scale(0.97); }
+    button:disabled { background: var(--border); cursor: not-allowed; }
+
+    /* ── Search results ── */
+    #results {
+      margin-top: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 360px;
+      overflow-y: auto;
+    }
+    #results::-webkit-scrollbar { width: 4px; }
+    #results::-webkit-scrollbar-track { background: transparent; }
+    #results::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .result-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .result-item:hover { border-color: var(--accent); background: #2a2a2a; }
+    .result-item.added { border-color: var(--green); opacity: .6; pointer-events: none; }
+
+    .result-poster {
+      width: 42px;
+      height: 62px;
+      object-fit: cover;
+      border-radius: 4px;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+    .result-info { flex: 1; min-width: 0; }
+    .result-name { font-weight: 600; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .result-year { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+
+    .add-btn {
+      background: var(--green);
+      border-radius: 6px;
+      font-size: 1.1rem;
+      padding: 6px 12px;
+      flex-shrink: 0;
+    }
+    .add-btn:hover { background: #5bc99a; }
+
+    #no-results { color: var(--muted); font-size: 0.9rem; text-align: center; padding: 12px 0; display: none; }
+
+    /* ── Selected shows ── */
+    #shows-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .empty-state {
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      padding: 20px 0;
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+    }
+
+    .show-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      animation: fadeIn .2s ease;
+    }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+
+    .show-poster {
+      width: 32px;
+      height: 48px;
+      object-fit: cover;
+      border-radius: 4px;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+    .show-name { flex: 1; font-weight: 600; font-size: 0.95rem; }
+    .remove-btn {
+      background: transparent;
+      border: 1px solid var(--red);
+      color: var(--red);
+      border-radius: 6px;
+      font-size: 0.8rem;
+      padding: 4px 10px;
+    }
+    .remove-btn:hover { background: var(--red); color: #fff; }
+
+    /* ── Install section ── */
+    .install-card { text-align: center; }
+    .install-card p { color: var(--muted); font-size: 0.88rem; margin-bottom: 18px; line-height: 1.6; }
+
+    .install-btn {
+      background: linear-gradient(135deg, #7b5ea7, #a47fd4);
+      border-radius: 10px;
+      font-size: 1.05rem;
+      padding: 14px 36px;
+      width: 100%;
+      max-width: 340px;
+      letter-spacing: .03em;
+    }
+    .install-btn:hover { opacity: .9; }
+
+    .url-box {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      word-break: break-all;
+      text-align: left;
+      margin-top: 14px;
+      display: none;
+    }
+    .url-box a { color: var(--accent2); text-decoration: none; }
+    .url-box a:hover { text-decoration: underline; }
+
+    .copy-row { display: flex; gap: 8px; margin-top: 10px; }
+    .copy-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      font-size: 0.82rem;
+      padding: 7px 14px;
+      border-radius: 7px;
+      flex: 1;
+    }
+    .copy-btn:hover { border-color: var(--accent); }
+
+    /* ── Spinner ── */
+    .spinner {
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      width: 22px; height: 22px;
+      animation: spin .7s linear infinite;
+      margin: 12px auto;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 22px;
+      font-size: 0.9rem;
+      opacity: 0;
+      transition: opacity .3s, transform .3s;
+      pointer-events: none;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ── Steps indicator ── */
+    .steps { display: flex; gap: 0; margin-bottom: 32px; width: 100%; max-width: 680px; }
+    .step { flex: 1; text-align: center; font-size: 0.78rem; color: var(--muted); padding: 8px 4px; border-bottom: 2px solid var(--border); }
+    .step.active { color: var(--accent2); border-color: var(--accent); font-weight: 600; }
+    .step span { display: block; font-size: 1.1rem; margin-bottom: 2px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">📺</div>
+  <h1>Random TV Channel</h1>
+  <p>Build your own personal TV channel inside Stremio</p>
+</header>
+
+<div class="steps">
+  <div class="step active"><span>🔍</span> Pick Shows</div>
+  <div class="step"><span>⚙️</span> Configure</div>
+  <div class="step"><span>🚀</span> Install</div>
+</div>
+
+<!-- Step 1: Search -->
+<div class="card" id="card-search">
+  <h2>Search &amp; add shows</h2>
+  <div class="search-row">
+    <input type="text" id="search-input" placeholder="e.g. Family Guy, Dragon Ball Z…" autocomplete="off" />
+    <button id="search-btn" onclick="search()">Search</button>
+  </div>
+  <div class="spinner" id="spinner"></div>
+  <div id="no-results">No results found</div>
+  <div id="results"></div>
+</div>
+
+<!-- Step 2: Selected shows -->
+<div class="card">
+  <h2>Your channel lineup (<span id="show-count">0</span>)</h2>
+  <div id="shows-list">
+    <div class="empty-state">Add at least one show above ☝️</div>
+  </div>
+</div>
+
+<!-- Step 3: Options -->
+<div class="card">
+  <h2>Channel settings</h2>
+  <div class="field">
+    <label>Channel name</label>
+    <input type="text" id="channel-name" placeholder="My TV Channel" maxlength="60" />
+  </div>
+  <div class="field">
+    <label>Episode rotation interval</label>
+    <select id="interval">
+      <option value="15">Every 15 minutes</option>
+      <option value="30" selected>Every 30 minutes</option>
+      <option value="60">Every 1 hour</option>
+      <option value="120">Every 2 hours</option>
+      <option value="240">Every 4 hours</option>
+    </select>
+  </div>
+</div>
+
+<!-- Step 4: Install -->
+<div class="card install-card">
+  <h2>Install in Stremio</h2>
+  <p>
+    Clicking the button below will open Stremio and install your personal TV channel.<br/>
+    When you open the channel you'll see what episode is playing now and the next 20 slots.
+  </p>
+  <button class="install-btn" onclick="install()">📺 Install in Stremio</button>
+  <div class="url-box" id="url-box">
+    Manual URL: <a id="manifest-link" href="#" target="_blank"></a>
+    <div class="copy-row">
+      <button class="copy-btn" onclick="copyUrl()">📋 Copy manifest URL</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  const shows = [];       // { id, name, poster }
+  const addedIds = new Set();
+
+  // ── Search ─────────────────────────────────────────────────────────────────
+  document.getElementById('search-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') search();
+  });
+
+  async function search() {
+    const q = document.getElementById('search-input').value.trim();
+    if (!q) return;
+
+    const spinner   = document.getElementById('spinner');
+    const noResults = document.getElementById('no-results');
+    const results   = document.getElementById('results');
+    const btn       = document.getElementById('search-btn');
+
+    spinner.style.display   = 'block';
+    noResults.style.display = 'none';
+    results.innerHTML       = '';
+    btn.disabled            = true;
+
+    try {
+      const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      const metas = data.metas || [];
+
+      spinner.style.display = 'none';
+      btn.disabled          = false;
+
+      if (metas.length === 0) {
+        noResults.style.display = 'block';
+        return;
+      }
+
+      metas.slice(0, 12).forEach(m => {
+        const div = document.createElement('div');
+        div.className = 'result-item' + (addedIds.has(m.id) ? ' added' : '');
+        div.dataset.id = m.id;
+
+        const posterSrc = m.poster || 'https://via.placeholder.com/42x62/1a1a1a/888?text=?';
+        const year = m.releaseInfo || '';
+
+        div.innerHTML = `
+          <img class="result-poster" src="${posterSrc}" alt="" loading="lazy"
+               onerror="this.src='https://via.placeholder.com/42x62/1a1a1a/888?text=?'" />
+          <div class="result-info">
+            <div class="result-name">${escHtml(m.name)}</div>
+            <div class="result-year">${escHtml(year)}</div>
+          </div>
+          <button class="add-btn" onclick="addShow('${m.id}', ${JSON.stringify(escHtml(m.name))}, ${JSON.stringify(m.poster || '')})">
+            ${addedIds.has(m.id) ? '✓' : '+'}
+          </button>`;
+
+        results.appendChild(div);
+      });
+
+    } catch {
+      spinner.style.display = 'none';
+      btn.disabled          = false;
+      toast('Search failed – check your connection');
+    }
+  }
+
+  // ── Add show ───────────────────────────────────────────────────────────────
+  function addShow(id, name, poster) {
+    if (addedIds.has(id)) return;
+    addedIds.add(id);
+    shows.push({ id, name, poster });
+    renderShows();
+    updateResultItem(id);
+    highlightStep(1);
+  }
+
+  function removeShow(id) {
+    addedIds.delete(id);
+    const idx = shows.findIndex(s => s.id === id);
+    if (idx !== -1) shows.splice(idx, 1);
+    renderShows();
+    // Re-enable in results if visible
+    const el = document.querySelector(`.result-item[data-id="${id}"]`);
+    if (el) { el.classList.remove('added'); el.querySelector('.add-btn').textContent = '+'; }
+  }
+
+  function updateResultItem(id) {
+    const el = document.querySelector(`.result-item[data-id="${id}"]`);
+    if (el) { el.classList.add('added'); el.querySelector('.add-btn').textContent = '✓'; }
+  }
+
+  // ── Render selected shows ──────────────────────────────────────────────────
+  function renderShows() {
+    const list = document.getElementById('shows-list');
+    document.getElementById('show-count').textContent = shows.length;
+
+    if (shows.length === 0) {
+      list.innerHTML = '<div class="empty-state">Add at least one show above ☝️</div>';
+      return;
+    }
+
+    list.innerHTML = shows.map(s => `
+      <div class="show-item">
+        <img class="show-poster" src="${s.poster || 'https://via.placeholder.com/32x48/1a1a1a/888?text=?'}" alt=""
+             onerror="this.src='https://via.placeholder.com/32x48/1a1a1a/888?text=?'" loading="lazy" />
+        <span class="show-name">${escHtml(s.name)}</span>
+        <button class="remove-btn" onclick="removeShow('${s.id}')">Remove</button>
+      </div>`).join('');
+  }
+
+  // ── Install ─────────────────────────────────────────────────────────────────
+  function buildConfig() {
+    return {
+      name: document.getElementById('channel-name').value.trim() || 'Random TV Channel',
+      interval: parseInt(document.getElementById('interval').value, 10),
+      shows: shows.map(s => ({ id: s.id, name: s.name, poster: s.poster })),
+    };
+  }
+
+  function encodeConfig(cfg) {
+    return btoa(unescape(encodeURIComponent(JSON.stringify(cfg))))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function install() {
+    if (shows.length === 0) {
+      toast('Add at least one show first!');
+      return;
+    }
+
+    const config     = buildConfig();
+    const encoded    = encodeConfig(config);
+    const origin     = window.location.origin;
+    const manifestUrl = `${origin}/${encoded}/manifest.json`;
+    const stremioUrl  = `stremio://${origin.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`;
+
+    // Show the URL box
+    const urlBox = document.getElementById('url-box');
+    const link   = document.getElementById('manifest-link');
+    link.href        = manifestUrl;
+    link.textContent = manifestUrl;
+    urlBox.style.display = 'block';
+
+    highlightStep(2);
+    window.location.href = stremioUrl;
+  }
+
+  function copyUrl() {
+    const config   = buildConfig();
+    const encoded  = encodeConfig(config);
+    const origin   = window.location.origin;
+    const manifest = `${origin}/${encoded}/manifest.json`;
+    navigator.clipboard.writeText(manifest).then(() => toast('Copied!'));
+  }
+
+  // ── Steps ──────────────────────────────────────────────────────────────────
+  function highlightStep(idx) {
+    document.querySelectorAll('.step').forEach((el, i) => {
+      el.classList.toggle('active', i <= idx);
+    });
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  let toastTimer;
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+  }
+</script>
+</body>
+</html>

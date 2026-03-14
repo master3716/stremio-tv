@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: stremio-random-tv
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: ADDON_URL
+        sync: false   # Set this to your Render public URL after first deploy
