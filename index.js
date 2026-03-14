@@ -222,7 +222,7 @@ app.get('/:config/manifest.json', (req, res) => {
     name:        channelName,
     description: `Your personal TV channel — playing: ${showNames}`,
     logo:        `${ADDON_URL}/logo.png`,
-    resources:   ['catalog', 'meta', 'stream'],
+    resources:   ['catalog', 'meta'],
     types:       ['series'],
     catalogs: [{
       type:  'series',
@@ -285,18 +285,21 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
         label = startsIn < 60 ? `+${startsIn}m` : `+${Math.round(startsIn / 60)}h`;
       }
 
+      // Use the REAL episode ID so Stremio asks TorrentioRD directly for streams
+      const realId = `${slot.showId}:${slot.season}:${slot.episode}`;
+
       return {
-        id:        `tvchannel:${req.params.config}:${slot.episodeIndex}`,
-        title:     `${label}  ${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} – ${slot.title}`,
-        season:    1,
-        number:    i + 1,
+        id:        realId,
+        title:     `${label}  ${slot.showName} – ${slot.title}`,
+        season:    slot.season,
+        number:    slot.episode,
         released:  new Date(slot.startsAtMs).toISOString(),
         thumbnail: slot.thumbnail || undefined,
-        overview:  `${slot.showName} · Season ${slot.season}, Episode ${slot.episode} · ${slot.runtime} min`,
+        overview:  `${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} · ${slot.runtime} min`,
       };
     });
 
-    // Tell Stremio which episode is playing NOW so it jumps straight to streams
+    // Auto-select the NOW episode when the channel is opened
     if (videos.length > 0) defaultVideoId = videos[0].id;
   } catch {}
 
@@ -317,7 +320,7 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
   });
 });
 
-// ─── Stream ───────────────────────────────────────────────────────────────────
+// ─── Stream (not declared in manifest — TorrentioRD handles streams directly) ─
 app.get('/:config/stream/series/:id.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.json({ streams: [] });
