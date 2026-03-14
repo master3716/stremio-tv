@@ -130,113 +130,131 @@ function resolveSchedule(episodes, nowMs, count = 20) {
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
-// ─── Stream resolution via RD API ─────────────────────────────────────────────
-async function resolveStreams(ep, config) {
-  const epId = `${ep.showId}:${ep.season}:${ep.episode}`;
-  const label = `${ep.showName} S${pad(ep.season)}E${pad(ep.episode)}`;
+// ─── Stream resolution: EZTV → RD API ────────────────────────────────────────
+//
+// Torrentio blocks all cloud server IPs (403).
+// Instead we use EZTV's public API (no IP blocking) to find torrent magnets,
+// then optionally unrestrict via Real-Debrid for direct video URLs.
 
-  // 1. Fetch infoHash streams from base Torrentio (no auth → no 403)
-  let baseStreams = [];
-  try {
-    const r = await axios.get(`${TORRENTIO}/stream/series/${epId}.json`, {
-      timeout: 10000,
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    });
-    baseStreams = (r.data.streams || []).filter(s => s.infoHash);
-    console.log(`[stream] ${label}: ${baseStreams.length} base streams`);
-  } catch (e) {
-    console.error(`[stream] Torrentio error for ${epId}:`, e.message);
-  }
+async function findMagnets(ep) {
+  const epCode = `S${pad(ep.season)}E${pad(ep.episode)}`;
+  const imdbNum = ep.showId.replace('tt', '');
 
-  if (baseStreams.length === 0) return [];
-
-  const rdKey = extractRdKey(config);
-
-  // No RD key → return infoHash streams (Stremio plays via BitTorrent)
-  if (!rdKey) return baseStreams.slice(0, 4);
-
-  // 2. Check which torrents are instantly cached on RD
-  const hashes = baseStreams.slice(0, 6).map(s => s.infoHash.toLowerCase());
-  let best = null;
+  // EZTV – free public API indexed by IMDB ID
   try {
     const r = await axios.get(
-      `${RD_API}/torrents/instantAvailability/${hashes.join('/')}?auth_token=${rdKey}`,
+      `https://eztv.re/api/get-torrents?imdb_id=${imdbNum}&limit=100`,
+      { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+    );
+    const all = r.data.torrents || [];
+    const matching = all
+      .filter(t => (t.title || '').toUpperCase().includes(epCode))
+      .sort((a, b) => (b.seeds || 0) - (a.seeds || 0));
+
+    console.log(`[eztv] ${ep.showName} ${epCode}: ${all.length} total, ${matching.length} matching`);
+
+    if (matching.length > 0) {
+      return matching.slice(0, 5).map(t => ({
+        magnet:   t.magnet_url,
+        infoHash: (t.magnet_url.match(/urn:btih:([a-f0-9]+)/i) || [])[1]?.toLowerCase(),
+        name:     t.title,
+        seeds:    t.seeds || 0,
+      })).filter(t => t.infoHash);
+    }
+  } catch (e) {
+    console.error(`[eztv] Error:`, e.message);
+  }
+  return [];
+}
+
+async function unrestrict(magnet, rdKey) {
+  const infoHash = (magnet.match(/urn:btih:([a-f0-9]+)/i) || [])[1]?.toLowerCase();
+  if (!infoHash) return null;
+
+  // Check RD instant availability
+  try {
+    const avail = await axios.get(
+      `${RD_API}/torrents/instantAvailability/${infoHash}?auth_token=${rdKey}`,
       { timeout: 6000 }
     );
-    for (const stream of baseStreams.slice(0, 6)) {
-      const info = r.data[stream.infoHash.toLowerCase()];
-      if (info?.rd?.length > 0) { best = stream; break; }
+    const cached = avail.data[infoHash];
+    if (!cached?.rd?.length) {
+      console.log(`[rd] ${infoHash.slice(0,8)}... not cached on RD`);
+      return null;
     }
-    console.log(`[stream] ${label}: RD cached = ${best ? best.infoHash.slice(0, 8) + '...' : 'none'}`);
   } catch (e) {
-    console.error(`[stream] RD availability error:`, e.message);
-    return baseStreams.slice(0, 4);
+    console.error(`[rd] availability check:`, e.message);
+    return null;
   }
 
-  if (!best) {
-    console.log(`[stream] ${label}: no cached torrents, using infoHash fallback`);
-    return baseStreams.slice(0, 4);
-  }
-
-  // 3. Add magnet to RD (idempotent — same hash returns existing torrent)
+  // Add magnet (idempotent)
   let rdId;
   try {
     const r = await axios.post(`${RD_API}/torrents/addMagnet`,
-      new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${best.infoHash}`, auth_token: rdKey }),
+      new URLSearchParams({ magnet, auth_token: rdKey }),
       { timeout: 8000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     rdId = r.data.id;
-  } catch (e) {
-    console.error(`[stream] RD addMagnet:`, e.message);
-    return baseStreams.slice(0, 4);
-  }
+  } catch (e) { console.error(`[rd] addMagnet:`, e.message); return null; }
 
-  // 4. Select files
+  // Select files
   try {
-    const fileNum = (best.fileIdx ?? 0) + 1;
     await axios.post(`${RD_API}/torrents/selectFiles/${rdId}`,
-      new URLSearchParams({ files: String(fileNum), auth_token: rdKey }),
+      new URLSearchParams({ files: 'all', auth_token: rdKey }),
       { timeout: 5000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
-  } catch {
-    // Try selecting all files as fallback
-    try {
-      await axios.post(`${RD_API}/torrents/selectFiles/${rdId}`,
-        new URLSearchParams({ files: 'all', auth_token: rdKey }),
-        { timeout: 5000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-      );
-    } catch (e) {
-      console.error(`[stream] RD selectFiles:`, e.message);
-      return baseStreams.slice(0, 4);
-    }
-  }
+  } catch (e) { console.error(`[rd] selectFiles:`, e.message); return null; }
 
-  // 5. Get links from torrent info
+  // Get links (retry 3x)
   let links = [];
-  try {
-    const r = await axios.get(`${RD_API}/torrents/info/${rdId}?auth_token=${rdKey}`, { timeout: 6000 });
-    links = r.data.links || [];
-  } catch (e) {
-    console.error(`[stream] RD info:`, e.message);
-    return baseStreams.slice(0, 4);
+  for (let i = 0; i < 3 && !links.length; i++) {
+    if (i) await new Promise(r => setTimeout(r, 800));
+    try {
+      const r = await axios.get(`${RD_API}/torrents/info/${rdId}?auth_token=${rdKey}`, { timeout: 6000 });
+      links = r.data.links || [];
+    } catch (e) { console.error(`[rd] info:`, e.message); }
   }
+  if (!links.length) return null;
 
-  if (links.length === 0) return baseStreams.slice(0, 4);
-
-  // 6. Unrestrict → direct video URL
+  // Unrestrict
   try {
     const r = await axios.post(`${RD_API}/unrestrict/link`,
       new URLSearchParams({ link: links[0], auth_token: rdKey }),
       { timeout: 6000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
-    const url      = r.data.download;
-    const filename = r.data.filename || '';
-    console.log(`[stream] ${label}: RD URL obtained ✓`);
-    return [{ url, name: `📺 ${ep.showName}\n[RD] ${best.name || ''}`.trim(), title: `${label} – ${ep.title}\n${filename}` }];
-  } catch (e) {
-    console.error(`[stream] RD unrestrict:`, e.message);
-    return baseStreams.slice(0, 4);
+    return r.data.download || null;
+  } catch (e) { console.error(`[rd] unrestrict:`, e.message); return null; }
+}
+
+async function resolveStreams(ep, config) {
+  const label  = `${ep.showName} S${pad(ep.season)}E${pad(ep.episode)}`;
+  const rdKey  = extractRdKey(config);
+  const magnets = await findMagnets(ep);
+
+  if (magnets.length === 0) {
+    console.log(`[stream] ${label}: no magnets found`);
+    return [];
   }
+
+  // Try RD unrestriction on the top magnets
+  if (rdKey) {
+    for (const t of magnets.slice(0, 3)) {
+      const url = await unrestrict(t.magnet, rdKey);
+      if (url) {
+        console.log(`[stream] ${label}: RD direct URL ✓`);
+        return [{ url, name: `📺 ${ep.showName}\n[RD] ${t.name || ''}`.trim(), title: `${label} – ${ep.title}` }];
+      }
+    }
+    console.log(`[stream] ${label}: no RD cache hit, falling back to infoHash`);
+  }
+
+  // Fallback: return infoHash streams for Stremio's built-in BitTorrent
+  return magnets.slice(0, 3).map(t => ({
+    infoHash: t.infoHash,
+    name:     `📺 ${ep.showName}\n${t.name || ''}`.trim(),
+    title:    `${label} – ${ep.title}`,
+    sources:  [`tracker:udp://tracker.opentrackr.org:1337/announce`],
+  }));
 }
 
 // ─── Static assets ───────────────────────────────────────────────────────────
