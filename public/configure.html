@@ -243,6 +243,11 @@
     <label>Channel name</label>
     <input type="text" id="channel-name" placeholder="My TV Channel" maxlength="60" />
   </div>
+  <div class="field">
+    <label>Torrentio manifest URL <span style="color:var(--muted);font-weight:400">(paste your Torrentio or TorrentioRD URL for better streams)</span></label>
+    <input type="text" id="torrentio-url" placeholder="https://torrentio.strem.fun/…/manifest.json" autocomplete="off" />
+    <span style="font-size:0.78rem;color:var(--muted)">Find it in Stremio → Add-ons → Torrentio → Configure → copy the manifest URL shown there.</span>
+  </div>
 </div>
 
 <!-- Install -->
@@ -275,7 +280,8 @@
   function saveToStorage() {
     const data = {
       shows,
-      name: document.getElementById('channel-name').value.trim(),
+      name:         document.getElementById('channel-name').value.trim(),
+      torrentioUrl: document.getElementById('torrentio-url').value.trim(),
     };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     flashSaved();
@@ -286,7 +292,8 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const data = JSON.parse(raw);
-      if (data.name) document.getElementById('channel-name').value = data.name;
+      if (data.name)         document.getElementById('channel-name').value  = data.name;
+      if (data.torrentioUrl) document.getElementById('torrentio-url').value = data.torrentioUrl;
       if (Array.isArray(data.shows)) {
         data.shows.forEach(s => {
           shows.push(s);
@@ -445,13 +452,17 @@
 
   // ── Settings auto-save ─────────────────────────────────────────────────────
   document.getElementById('channel-name').addEventListener('input', saveToStorage);
+  document.getElementById('torrentio-url').addEventListener('input', saveToStorage);
 
   // ── Install ────────────────────────────────────────────────────────────────
   function buildConfig() {
-    return {
+    const torrentioUrl = document.getElementById('torrentio-url').value.trim();
+    const cfg = {
       name:  document.getElementById('channel-name').value.trim() || 'Random TV Channel',
       shows: shows.map(s => ({ id: s.id, name: s.name, poster: s.poster })),
     };
+    if (torrentioUrl) cfg.torrentioUrl = torrentioUrl;
+    return cfg;
   }
 
   function encodeConfig(cfg) {

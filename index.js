@@ -270,6 +270,7 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
   const now       = Date.now();
 
   let videos = [];
+  let defaultVideoId;
   try {
     const eps      = await buildSchedule(config.shows || []);
     const schedule = resolveSchedule(eps, now, 20);
@@ -285,15 +286,18 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
       }
 
       return {
-        id:       `tvchannel:${req.params.config}:${slot.episodeIndex}`,
-        title:    `${label}  ${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} – ${slot.title}`,
-        season:   1,
-        number:   i + 1,
-        released: new Date(slot.startsAtMs).toISOString(),
+        id:        `tvchannel:${req.params.config}:${slot.episodeIndex}`,
+        title:     `${label}  ${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} – ${slot.title}`,
+        season:    1,
+        number:    i + 1,
+        released:  new Date(slot.startsAtMs).toISOString(),
         thumbnail: slot.thumbnail || undefined,
-        overview: `${slot.showName} · Season ${slot.season}, Episode ${slot.episode} · ${slot.runtime} min`,
+        overview:  `${slot.showName} · Season ${slot.season}, Episode ${slot.episode} · ${slot.runtime} min`,
       };
     });
+
+    // Tell Stremio which episode is playing NOW so it jumps straight to streams
+    if (videos.length > 0) defaultVideoId = videos[0].id;
   } catch {}
 
   res.json({
@@ -305,6 +309,10 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
       description: `Your personal random TV channel.\nShowing: ${showNames}\nEpisodes advance automatically when each one ends.`,
       genres:      ['Random TV', 'Channel'],
       videos,
+      behaviorHints: {
+        defaultVideoId,     // auto-selects the NOW episode on open
+        hasScheduledVideos: true,
+      },
     },
   });
 });
@@ -332,11 +340,16 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
   const episodeLabel = `S${pad(ep.season)}E${pad(ep.episode)}`;
   const fullTitle    = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
 
-  // Fetch streams from Torrentio
+  // Use user's Torrentio URL (e.g. TorrentioRD) if configured, else fallback
+  const torrentioBase = config.torrentioUrl
+    ? config.torrentioUrl.replace(/\/manifest\.json$/, '')
+    : TORRENTIO;
+
+  // Fetch streams
   let torrentStreams = [];
   try {
     const r = await axios.get(
-      `${TORRENTIO}/stream/series/${ep.showId}:${ep.season}:${ep.episode}.json`,
+      `${torrentioBase}/stream/series/${ep.showId}:${ep.season}:${ep.episode}.json`,
       { timeout: 12000 }
     );
     torrentStreams = (r.data.streams || []).slice(0, 6);
@@ -352,11 +365,15 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
     });
   }
 
+  const bingeGroup = `tvchannel-${req.params.config.substring(0, 8)}`;
+
   res.json({
     streams: torrentStreams.map(s => ({
       ...s,
       name:  `📺 ${ep.showName}\n${s.name || ''}`.trim(),
       title: `${fullTitle}\n${s.title || ''}`.trim(),
+      // bingeGroup enables Stremio's auto-play next episode feature
+      behaviorHints: { bingeGroup },
     })),
   });
 });
