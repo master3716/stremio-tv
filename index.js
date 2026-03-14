@@ -329,38 +329,62 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
 
   let ep;
   try {
-    const eps     = await buildSchedule(config.shows || []);
-    if (eps.length === 0) return res.json({ streams: [] });
+    const eps = await buildSchedule(config.shows || []);
+    if (eps.length === 0) {
+      console.error('[stream] buildSchedule returned 0 episodes — check show IDs in config');
+      return res.json({ streams: [] });
+    }
     const shuffled = seededShuffle(eps, Math.floor(episodeIndex / eps.length));
     ep = shuffled[episodeIndex % eps.length];
-  } catch { return res.json({ streams: [] }); }
+  } catch (e) {
+    console.error('[stream] buildSchedule error:', e.message);
+    return res.json({ streams: [] });
+  }
 
   if (!ep) return res.json({ streams: [] });
 
   const episodeLabel = `S${pad(ep.season)}E${pad(ep.episode)}`;
   const fullTitle    = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
+  const torrentId    = `${ep.showId}:${ep.season}:${ep.episode}`;
+
+  console.log(`[stream] Resolving: ${fullTitle} → ${torrentId}`);
 
   // Build Torrentio base URL — use RD key if provided
   const torrentioBase = config.rdKey
-    ? `${TORRENTIO}/realdebrid=${encodeURIComponent(config.rdKey)}`
+    ? `${TORRENTIO}/realdebrid=${config.rdKey}`
     : TORRENTIO;
 
-  // Fetch streams
+  // Fetch streams — try with RD, fall back to base Torrentio if RD returns nothing
   let torrentStreams = [];
+  const fetchStreams = async (base) => {
+    const url = `${base}/stream/series/${torrentId}.json`;
+    console.log(`[stream] Fetching: ${url.replace(/realdebrid=[^/]+/, 'realdebrid=***')}`);
+    const r = await axios.get(url, {
+      timeout: 15000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Stremio)' },
+    });
+    return r.data.streams || [];
+  };
+
   try {
-    const r = await axios.get(
-      `${torrentioBase}/stream/series/${ep.showId}:${ep.season}:${ep.episode}.json`,
-      { timeout: 12000 }
-    );
-    torrentStreams = (r.data.streams || []).slice(0, 6);
-  } catch {}
+    torrentStreams = await fetchStreams(torrentioBase);
+    // If RD was configured but returned nothing, try base Torrentio as fallback
+    if (torrentStreams.length === 0 && config.rdKey) {
+      console.log('[stream] RD returned 0 streams, trying base Torrentio');
+      torrentStreams = await fetchStreams(TORRENTIO);
+    }
+  } catch (e) {
+    console.error('[stream] Torrentio fetch error:', e.message);
+  }
+
+  console.log(`[stream] Got ${torrentStreams.length} streams for ${torrentId}`);
 
   if (torrentStreams.length === 0) {
     return res.json({
       streams: [{
         name:        `📺 ${ep.showName}`,
-        title:       `${episodeLabel} · ${ep.title}\n⚠️ No streams found – install Torrentio`,
-        externalUrl: `https://www.imdb.com/title/${ep.showId}/`,
+        title:       `${episodeLabel} · ${ep.title}\n⚠️ No streams found for this episode`,
+        externalUrl: `https://www.imdb.com/title/${ep.showId}/episodes/?season=${ep.season}`,
       }],
     });
   }
@@ -368,11 +392,10 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
   const bingeGroup = `tvchannel-${req.params.config.substring(0, 8)}`;
 
   res.json({
-    streams: torrentStreams.map(s => ({
+    streams: torrentStreams.slice(0, 6).map(s => ({
       ...s,
       name:  `📺 ${ep.showName}\n${s.name || ''}`.trim(),
       title: `${fullTitle}\n${s.title || ''}`.trim(),
-      // bingeGroup enables Stremio's auto-play next episode feature
       behaviorHints: { bingeGroup },
     })),
   });
