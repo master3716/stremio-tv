@@ -8,11 +8,12 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 7000;
+const PORT      = process.env.PORT || 7000;
 const ADDON_URL = (process.env.ADDON_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 
 const CINEMETA  = 'https://v3-cinemeta.strem.io';
 const TORRENTIO = 'https://torrentio.strem.fun';
+const RD_API    = 'https://api.real-debrid.com/rest/1.0';
 
 // ─── Seeded PRNG (Mulberry32) ────────────────────────────────────────────────
 function seededRandom(seed) {
@@ -27,12 +28,17 @@ function seededRandom(seed) {
 
 // ─── Config helpers ──────────────────────────────────────────────────────────
 function decodeConfig(str) {
-  try {
-    return JSON.parse(Buffer.from(str, 'base64url').toString('utf8'));
-  } catch { return null; }
+  try { return JSON.parse(Buffer.from(str, 'base64url').toString('utf8')); }
+  catch { return null; }
 }
 
-// ─── CINEMETA helpers ─────────────────────────────────────────────────────────
+function extractRdKey(config) {
+  if (!config.torrentioUrl) return null;
+  const m = config.torrentioUrl.match(/realdebrid=([^/|&]+)/i);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// ─── CINEMETA ─────────────────────────────────────────────────────────────────
 const metaCache = new Map();
 
 async function fetchShowMeta(showId) {
@@ -40,53 +46,39 @@ async function fetchShowMeta(showId) {
   const res = await axios.get(`${CINEMETA}/meta/series/${showId}.json`, { timeout: 10000 });
   const meta = res.data.meta;
   metaCache.set(showId, meta);
-  setTimeout(() => metaCache.delete(showId), 7200000); // 2hr TTL
+  setTimeout(() => metaCache.delete(showId), 7200000);
   return meta;
 }
 
-function parseRuntime(runtimeStr) {
-  if (!runtimeStr) return null;
-  const m = String(runtimeStr).match(/(\d+)/);
+function parseRuntime(str) {
+  const m = String(str || '').match(/(\d+)/);
   return m ? parseInt(m[1], 10) : null;
 }
 
-// ─── Schedule logic ───────────────────────────────────────────────────────────
-//
-// Episodes play back-to-back in a deterministic shuffled order.
-// Each episode's slot duration = the show's typical runtime (from CINEMETA).
-// After all episodes have played, the list cycles again with a new shuffle.
-// The current episode is determined by where the current wall-clock time falls
-// in the cumulative runtime timeline.
-//
-// This means the channel naturally advances to the next episode when the
-// current one ends, just like a real TV channel.
-
+// ─── Schedule ─────────────────────────────────────────────────────────────────
 async function buildSchedule(shows) {
   const allEps = [];
   for (const show of shows) {
     let meta;
     try { meta = await fetchShowMeta(show.id); } catch { continue; }
-
-    const runtime = parseRuntime(meta?.runtime) || 22; // minutes, fallback 22
-    const episodes = (meta?.videos || []).filter(v => v.season > 0 && (v.episode || v.number));
-
-    for (const ep of episodes) {
+    const runtime = parseRuntime(meta?.runtime) || 22;
+    for (const ep of (meta?.videos || [])) {
+      const epNum = ep.episode ?? ep.number;
+      if (!ep.season || ep.season <= 0 || !epNum) continue;
       allEps.push({
         showId:    show.id,
         showName:  show.name,
-        showPoster: show.poster || null,
         season:    ep.season,
-        episode:   ep.episode || ep.number,
-        title:     ep.name || ep.title || `Episode ${ep.episode || ep.number}`,
+        episode:   epNum,
+        title:     ep.name || ep.title || `Episode ${epNum}`,
         thumbnail: ep.thumbnail || null,
-        runtime,   // minutes
+        runtime,
       });
     }
   }
   return allEps;
 }
 
-// Deterministically shuffle an array using a seeded PRNG
 function seededShuffle(arr, seed) {
   const a = [...arr];
   const rand = seededRandom(seed);
@@ -97,81 +89,163 @@ function seededShuffle(arr, seed) {
   return a;
 }
 
-// Given the full episode list, return which episode is playing at `nowMs`
-// and all upcoming episodes (for the schedule view).
-// The list cycles: after the last episode, it reshuffles with a new seed.
-function resolveSchedule(episodes, nowMs, upcomingCount = 20) {
+function resolveSchedule(episodes, nowMs, count = 20) {
   if (episodes.length === 0) return [];
 
-  const nowMinutes = nowMs / 60000;
-  const result = [];
+  const nowMin   = nowMs / 60000;
+  const cycleLen = episodes.reduce((s, e) => s + e.runtime, 0);
+  if (cycleLen === 0) return [];
 
-  // We walk forward in time from the beginning of the first cycle
-  // Cycle 0 uses seed 0, cycle 1 uses seed 1, etc.
-  // Each cycle is a fresh shuffle of the full episode list.
+  const cycle      = Math.floor(nowMin / cycleLen);
+  const posInCycle = nowMin % cycleLen;
+  let shuffled     = seededShuffle(episodes, cycle);
 
-  let timeAccum = 0;
-  let cycle = 0;
-
-  // Find where we are right now first (fast-forward to current position)
-  // Total runtime per cycle
-  const totalRuntimePerCycle = episodes.reduce((s, e) => s + e.runtime, 0);
-  if (totalRuntimePerCycle === 0) return [];
-
-  // Which cycle are we in?
-  cycle = Math.floor(nowMinutes / totalRuntimePerCycle);
-  const posInCycle = nowMinutes % totalRuntimePerCycle;
-
-  // Walk the current cycle to find the current episode
-  let shuffled = seededShuffle(episodes, cycle);
-  let cumul = 0;
-  let startIdx = 0;
+  // Find which episode is playing right now
+  let cumul = 0, startIdx = 0, timeAccum = cycle * cycleLen;
   for (let i = 0; i < shuffled.length; i++) {
     if (posInCycle < cumul + shuffled[i].runtime) {
-      startIdx = i;
-      timeAccum = cycle * totalRuntimePerCycle + cumul;
+      startIdx  = i;
+      timeAccum = cycle * cycleLen + cumul;
       break;
     }
     cumul += shuffled[i].runtime;
   }
 
-  // Now collect `upcomingCount` episodes starting from current
-  let c = cycle;
-  let sh = shuffled;
-  let idx = startIdx;
+  const result = [];
+  let c = cycle, sh = shuffled, idx = startIdx;
 
-  while (result.length < upcomingCount) {
+  while (result.length < count) {
     const ep = sh[idx];
     result.push({
       ...ep,
-      startsAtMs: timeAccum * 60000,
-      endsAtMs:   (timeAccum + ep.runtime) * 60000,
+      startsAtMs:   timeAccum * 60000,
+      endsAtMs:     (timeAccum + ep.runtime) * 60000,
       episodeIndex: c * episodes.length + idx,
     });
     timeAccum += ep.runtime;
-    idx++;
-    if (idx >= sh.length) {
-      c++;
-      sh = seededShuffle(episodes, c);
-      idx = 0;
-    }
+    if (++idx >= sh.length) { c++; sh = seededShuffle(episodes, c); idx = 0; }
   }
-
   return result;
 }
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
+// ─── Stream resolution via RD API ─────────────────────────────────────────────
+async function resolveStreams(ep, config) {
+  const epId = `${ep.showId}:${ep.season}:${ep.episode}`;
+  const label = `${ep.showName} S${pad(ep.season)}E${pad(ep.episode)}`;
+
+  // 1. Fetch infoHash streams from base Torrentio (no auth → no 403)
+  let baseStreams = [];
+  try {
+    const r = await axios.get(`${TORRENTIO}/stream/series/${epId}.json`, {
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    baseStreams = (r.data.streams || []).filter(s => s.infoHash);
+    console.log(`[stream] ${label}: ${baseStreams.length} base streams`);
+  } catch (e) {
+    console.error(`[stream] Torrentio error for ${epId}:`, e.message);
+  }
+
+  if (baseStreams.length === 0) return [];
+
+  const rdKey = extractRdKey(config);
+
+  // No RD key → return infoHash streams (Stremio plays via BitTorrent)
+  if (!rdKey) return baseStreams.slice(0, 4);
+
+  // 2. Check which torrents are instantly cached on RD
+  const hashes = baseStreams.slice(0, 6).map(s => s.infoHash.toLowerCase());
+  let best = null;
+  try {
+    const r = await axios.get(
+      `${RD_API}/torrents/instantAvailability/${hashes.join('/')}?auth_token=${rdKey}`,
+      { timeout: 6000 }
+    );
+    for (const stream of baseStreams.slice(0, 6)) {
+      const info = r.data[stream.infoHash.toLowerCase()];
+      if (info?.rd?.length > 0) { best = stream; break; }
+    }
+    console.log(`[stream] ${label}: RD cached = ${best ? best.infoHash.slice(0, 8) + '...' : 'none'}`);
+  } catch (e) {
+    console.error(`[stream] RD availability error:`, e.message);
+    return baseStreams.slice(0, 4);
+  }
+
+  if (!best) {
+    console.log(`[stream] ${label}: no cached torrents, using infoHash fallback`);
+    return baseStreams.slice(0, 4);
+  }
+
+  // 3. Add magnet to RD (idempotent — same hash returns existing torrent)
+  let rdId;
+  try {
+    const r = await axios.post(`${RD_API}/torrents/addMagnet`,
+      new URLSearchParams({ magnet: `magnet:?xt=urn:btih:${best.infoHash}`, auth_token: rdKey }),
+      { timeout: 8000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    rdId = r.data.id;
+  } catch (e) {
+    console.error(`[stream] RD addMagnet:`, e.message);
+    return baseStreams.slice(0, 4);
+  }
+
+  // 4. Select files
+  try {
+    const fileNum = (best.fileIdx ?? 0) + 1;
+    await axios.post(`${RD_API}/torrents/selectFiles/${rdId}`,
+      new URLSearchParams({ files: String(fileNum), auth_token: rdKey }),
+      { timeout: 5000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+  } catch {
+    // Try selecting all files as fallback
+    try {
+      await axios.post(`${RD_API}/torrents/selectFiles/${rdId}`,
+        new URLSearchParams({ files: 'all', auth_token: rdKey }),
+        { timeout: 5000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+      );
+    } catch (e) {
+      console.error(`[stream] RD selectFiles:`, e.message);
+      return baseStreams.slice(0, 4);
+    }
+  }
+
+  // 5. Get links from torrent info
+  let links = [];
+  try {
+    const r = await axios.get(`${RD_API}/torrents/info/${rdId}?auth_token=${rdKey}`, { timeout: 6000 });
+    links = r.data.links || [];
+  } catch (e) {
+    console.error(`[stream] RD info:`, e.message);
+    return baseStreams.slice(0, 4);
+  }
+
+  if (links.length === 0) return baseStreams.slice(0, 4);
+
+  // 6. Unrestrict → direct video URL
+  try {
+    const r = await axios.post(`${RD_API}/unrestrict/link`,
+      new URLSearchParams({ link: links[0], auth_token: rdKey }),
+      { timeout: 6000, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const url      = r.data.download;
+    const filename = r.data.filename || '';
+    console.log(`[stream] ${label}: RD URL obtained ✓`);
+    return [{ url, name: `📺 ${ep.showName}\n[RD] ${best.name || ''}`.trim(), title: `${label} – ${ep.title}\n${filename}` }];
+  } catch (e) {
+    console.error(`[stream] RD unrestrict:`, e.message);
+    return baseStreams.slice(0, 4);
+  }
+}
+
 // ─── Static assets ───────────────────────────────────────────────────────────
 app.get('/channel-poster.png', (_req, res) => {
   res.setHeader('Content-Type', 'image/svg+xml');
   res.send(`<svg xmlns="http://www.w3.org/2000/svg" width="200" height="300" viewBox="0 0 200 300">
-    <defs>
-      <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-        <stop offset="0%" stop-color="#1a1a2e"/>
-        <stop offset="100%" stop-color="#2d1b4e"/>
-      </linearGradient>
-    </defs>
+    <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/><stop offset="100%" stop-color="#2d1b4e"/>
+    </linearGradient></defs>
     <rect width="200" height="300" fill="url(#g)" rx="8"/>
     <text x="100" y="130" font-size="70" text-anchor="middle" dominant-baseline="middle">📺</text>
     <text x="100" y="200" font-size="15" fill="#a47fd4" text-anchor="middle" font-family="sans-serif" font-weight="bold">RANDOM TV</text>
@@ -180,7 +254,6 @@ app.get('/channel-poster.png', (_req, res) => {
     <text x="112" y="262" font-size="10" fill="#e05260" font-family="sans-serif" font-weight="bold">LIVE</text>
   </svg>`);
 });
-
 app.get('/logo.png', (_req, res) => {
   res.setHeader('Content-Type', 'image/svg+xml');
   res.send(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
@@ -189,13 +262,11 @@ app.get('/logo.png', (_req, res) => {
   </svg>`);
 });
 
-// ─── Configure page ──────────────────────────────────────────────────────────
-app.get('/configure', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'configure.html'));
-});
+// ─── Configure ────────────────────────────────────────────────────────────────
+app.get('/configure', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'configure.html')));
 app.get('/', (_req, res) => res.redirect('/configure'));
 
-// ─── API proxy ───────────────────────────────────────────────────────────────
+// ─── API proxy ────────────────────────────────────────────────────────────────
 app.get('/api/search', async (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.json({ metas: [] });
@@ -212,22 +283,16 @@ app.get('/api/search', async (req, res) => {
 app.get('/:config/manifest.json', (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
-
-  const showNames   = (config.shows || []).map(s => s.name).join(', ');
-  const channelName = config.name || 'Random TV Channel';
-
   res.json({
     id:          `tv.randomchannel.${req.params.config.substring(0, 16)}`,
     version:     '1.0.0',
-    name:        channelName,
-    description: `Your personal TV channel — playing: ${showNames}`,
+    name:        config.name || 'Random TV Channel',
+    description: `Playing: ${(config.shows || []).map(s => s.name).join(', ')}`,
     logo:        `${ADDON_URL}/logo.png`,
-    resources:   ['catalog', 'meta'],
+    resources:   ['catalog', 'meta', 'stream'],
     types:       ['series'],
     catalogs: [{
-      type:  'series',
-      id:    'tv-channel',
-      name:  channelName,
+      type: 'series', id: 'tv-channel', name: config.name || 'Random TV Channel',
       extra: [{ name: 'skip', isRequired: false }],
     }],
     behaviorHints: { adult: false, p2p: false },
@@ -239,13 +304,13 @@ app.get('/:config/catalog/series/tv-channel.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
 
-  let desc = `Your random channel with ${(config.shows || []).map(s => s.name).join(', ')}`;
+  let desc = (config.shows || []).map(s => s.name).join(', ');
   try {
-    const eps = await buildSchedule(config.shows || []);
+    const eps      = await buildSchedule(config.shows || []);
     const schedule = resolveSchedule(eps, Date.now(), 1);
-    if (schedule.length > 0) {
-      const now = schedule[0];
-      desc = `Now: ${now.showName} · S${pad(now.season)}E${pad(now.episode)} – ${now.title}`;
+    if (schedule[0]) {
+      const n = schedule[0];
+      desc = `Now: ${n.showName} · S${pad(n.season)}E${pad(n.episode)} – ${n.title}`;
     }
   } catch {}
 
@@ -266,42 +331,36 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.status(400).json({ error: 'Invalid config' });
 
-  const showNames = (config.shows || []).map(s => s.name).join(', ');
-  const now       = Date.now();
-
-  let videos = [];
+  const now     = Date.now();
+  let videos    = [];
   let defaultVideoId;
+
   try {
     const eps      = await buildSchedule(config.shows || []);
     const schedule = resolveSchedule(eps, now, 20);
 
     videos = schedule.map((slot, i) => {
       const minsLeft = Math.round((slot.endsAtMs - now) / 60000);
-      let label;
-      if (i === 0)       label = `🔴 NOW  (${minsLeft}m left)`;
-      else if (i === 1)  label = '⏭ NEXT';
-      else {
-        const startsIn = Math.round((slot.startsAtMs - now) / 60000);
-        label = startsIn < 60 ? `+${startsIn}m` : `+${Math.round(startsIn / 60)}h`;
-      }
-
-      // Use the REAL episode ID so Stremio asks TorrentioRD directly for streams
-      const realId = `${slot.showId}:${slot.season}:${slot.episode}`;
+      const label =
+        i === 0 ? `🔴 NOW  (${minsLeft}m left)` :
+        i === 1 ? '⏭ NEXT' :
+        (() => { const m = Math.round((slot.startsAtMs - now) / 60000); return m < 60 ? `+${m}m` : `+${Math.round(m/60)}h`; })();
 
       return {
-        id:        realId,
+        id:        `tvchannel:${req.params.config}:${slot.episodeIndex}`,
         title:     `${label}  ${slot.showName} – ${slot.title}`,
-        season:    slot.season,
-        number:    slot.episode,
+        season:    1,
+        number:    i + 1,
         released:  new Date(slot.startsAtMs).toISOString(),
         thumbnail: slot.thumbnail || undefined,
         overview:  `${slot.showName} · S${pad(slot.season)}E${pad(slot.episode)} · ${slot.runtime} min`,
       };
     });
 
-    // Auto-select the NOW episode when the channel is opened
     if (videos.length > 0) defaultVideoId = videos[0].id;
-  } catch {}
+  } catch (e) {
+    console.error('[meta] error:', e.message);
+  }
 
   res.json({
     meta: {
@@ -309,23 +368,19 @@ app.get('/:config/meta/series/:id.json', async (req, res) => {
       type:        'series',
       name:        config.name || 'Random TV Channel',
       poster:      `${ADDON_URL}/channel-poster.png`,
-      description: `Your personal random TV channel.\nShowing: ${showNames}\nEpisodes advance automatically when each one ends.`,
+      description: `Your random TV channel — episodes advance when each one ends.`,
       genres:      ['Random TV', 'Channel'],
       videos,
-      behaviorHints: {
-        defaultVideoId,     // auto-selects the NOW episode on open
-        hasScheduledVideos: true,
-      },
+      behaviorHints: { defaultVideoId, hasScheduledVideos: true },
     },
   });
 });
 
-// ─── Stream (not declared in manifest — TorrentioRD handles streams directly) ─
+// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/:config/stream/series/:id.json', async (req, res) => {
   const config = decodeConfig(req.params.config);
   if (!config) return res.json({ streams: [] });
 
-  // ID format: tvchannel:{configHash}:{episodeIndex}
   const parts        = req.params.id.split(':');
   const episodeIndex = parseInt(parts[parts.length - 1], 10);
   if (isNaN(episodeIndex)) return res.json({ streams: [] });
@@ -333,78 +388,28 @@ app.get('/:config/stream/series/:id.json', async (req, res) => {
   let ep;
   try {
     const eps = await buildSchedule(config.shows || []);
-    if (eps.length === 0) {
-      console.error('[stream] buildSchedule returned 0 episodes — check show IDs in config');
-      return res.json({ streams: [] });
-    }
+    if (!eps.length) return res.json({ streams: [] });
     const shuffled = seededShuffle(eps, Math.floor(episodeIndex / eps.length));
     ep = shuffled[episodeIndex % eps.length];
   } catch (e) {
-    console.error('[stream] buildSchedule error:', e.message);
+    console.error('[stream] schedule error:', e.message);
     return res.json({ streams: [] });
   }
-
   if (!ep) return res.json({ streams: [] });
 
-  const episodeLabel = `S${pad(ep.season)}E${pad(ep.episode)}`;
-  const fullTitle    = `${ep.showName} – ${episodeLabel} – ${ep.title}`;
-  const torrentId    = `${ep.showId}:${ep.season}:${ep.episode}`;
+  console.log(`[stream] ${ep.showName} S${pad(ep.season)}E${pad(ep.episode)} – ${ep.title}`);
 
-  console.log(`[stream] Resolving: ${fullTitle} → ${torrentId}`);
-
-  // Build Torrentio base URL from manifest URL (strip /manifest.json if present)
-  // Supports both torrentioUrl (full manifest URL) and legacy rdKey field
-  const torrentioBase = config.torrentioUrl
-    ? config.torrentioUrl.replace(/\/manifest\.json$/, '')
-    : config.rdKey
-      ? `${TORRENTIO}/realdebrid=${config.rdKey}`
-      : TORRENTIO;
-
-  // Fetch streams — try with RD, fall back to base Torrentio if RD returns nothing
-  let torrentStreams = [];
-  const fetchStreams = async (base) => {
-    const url = `${base}/stream/series/${torrentId}.json`;
-    console.log(`[stream] Fetching: ${url.replace(/realdebrid=[^/]+/, 'realdebrid=***')}`);
-    const r = await axios.get(url, {
-      timeout: 15000,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Stremio)' },
-    });
-    return r.data.streams || [];
-  };
-
-  try {
-    torrentStreams = await fetchStreams(torrentioBase);
-    // If RD was configured but returned nothing, try base Torrentio as fallback
-    if (torrentStreams.length === 0 && config.rdKey) {
-      console.log('[stream] RD returned 0 streams, trying base Torrentio');
-      torrentStreams = await fetchStreams(TORRENTIO);
-    }
-  } catch (e) {
-    console.error('[stream] Torrentio fetch error:', e.message);
-  }
-
-  console.log(`[stream] Got ${torrentStreams.length} streams for ${torrentId}`);
-
-  if (torrentStreams.length === 0) {
-    console.error(`[stream] No streams found for ${torrentId} using base: ${torrentioBase.replace(/realdebrid=[^/]+/, 'realdebrid=***')}`);
-    return res.json({ streams: [] });
-  }
-
+  const streams    = await resolveStreams(ep, config);
   const bingeGroup = `tvchannel-${req.params.config.substring(0, 8)}`;
 
   res.json({
-    streams: torrentStreams.slice(0, 6).map(s => ({
-      ...s,
-      name:  `📺 ${ep.showName}\n${s.name || ''}`.trim(),
-      title: `${fullTitle}\n${s.title || ''}`.trim(),
-      behaviorHints: { bingeGroup },
-    })),
+    streams: streams.map(s => ({ ...s, behaviorHints: { bingeGroup } })),
   });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🎬  Random TV Channel addon`);
+  console.log(`\n🎬  Random TV Channel`);
   console.log(`    Configure → ${ADDON_URL}/configure`);
-  console.log(`    Running on port ${PORT}\n`);
+  console.log(`    Port ${PORT}\n`);
 });
